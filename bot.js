@@ -1,12 +1,13 @@
 /**
- * bot.js — Word Grid Solver Bot (GramJS MTProto + Bot API file download)
+ * bot.js — Word Grid Solver Bot (pure GramJS MTProto, zero Bot API HTTP calls)
  *
- * Architecture:
- *   • GramJS (MTProto) handles ALL message events — no HTTP polling
- *   • Image download: GramJS downloadFileV2 via InputPhotoFileLocation
- *     (passing the full Message to downloadMedia silently returns 0 bytes
- *      for bots because stripped sizes; we build the location manually)
- *   • Final fallback: Bot API getFile → HTTPS stream (always works)
+ * Download strategy (MTProto only, two attempts):
+ *   1. Re-fetch message via client.getMessages() → fresh fileReference
+ *      → downloadFileV2 with explicit InputPhotoFileLocation + correct dcId
+ *   2. client.downloadMedia() on the re-fetched message (GramJS full flow)
+ *
+ * Both private chats and groups are handled identically — GramJS resolves
+ * the entity and handles DC auth export automatically.
  *
  * Required env vars:
  *   BOT_TOKEN   – Telegram bot token  (from @BotFather)
@@ -21,32 +22,30 @@
 
 require('dotenv').config();
 
-const { TelegramClient }    = require('telegram');
-const { StringSession }     = require('telegram/sessions');
-const { NewMessage }        = require('telegram/events');
-const { Api }               = require('telegram');
-const { downloadFileV2 }    = require('telegram/client/downloads');
-const bigInt                = require('big-integer');
+const { TelegramClient } = require('telegram');
+const { StringSession }  = require('telegram/sessions');
+const { NewMessage }     = require('telegram/events');
+const { Api }            = require('telegram');
+const bigInt             = require('big-integer');
 
 const express = require('express');
 const fs      = require('fs');
-const https   = require('https');
 const path    = require('path');
 
 const { extractGrid } = require('./ocr');
 const { solve }       = require('./solver');
+
+// ─── downloadFileV2 from GramJS internals ─────────────────────────────────────
+const { downloadFileV2 } = require('./node_modules/telegram/client/downloads');
 
 // ─── Environment ──────────────────────────────────────────────────────────────
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const API_ID    = parseInt(process.env.API_ID  || '0', 10);
 const API_HASH  = process.env.API_HASH || '';
 
-if (!BOT_TOKEN) {
-  console.error('[FATAL] BOT_TOKEN is required.');
-  process.exit(1);
-}
+if (!BOT_TOKEN) { console.error('[FATAL] BOT_TOKEN is required.'); process.exit(1); }
 if (!API_ID || !API_HASH) {
-  console.error('[FATAL] API_ID and API_HASH are required for GramJS MTProto.');
+  console.error('[FATAL] API_ID and API_HASH are required (https://my.telegram.org/apps)');
   process.exit(1);
 }
 
@@ -64,9 +63,7 @@ try {
   console.error('[Dict] Failed to load dictionary:', err.message);
 }
 
-function isWord(w) {
-  return dictionary.has((w || '').toLowerCase());
-}
+function isWord(w) { return dictionary.has((w || '').toLowerCase()); }
 
 // ─── Stats ────────────────────────────────────────────────────────────────────
 const stats = {
@@ -77,32 +74,22 @@ const stats = {
 };
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
-function sleep(ms) {
-  return new Promise(r => setTimeout(r, ms));
-}
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-async function deleteFile(filePath) {
+async function deleteFile(p) {
   for (let i = 0; i < 5; i++) {
-    try {
-      if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
-      return;
-    } catch (_) {
-      await sleep(500);
-    }
+    try { if (fs.existsSync(p)) fs.unlinkSync(p); return; } catch (_) { await sleep(500); }
   }
 }
 
-// ─── Image download ───────────────────────────────────────────────────────────
-
+// ─── Photo size picker ────────────────────────────────────────────────────────
 /**
- * Pick the largest non-stripped, non-empty PhotoSize from photo.sizes.
- * Returns the size object or null.
+ * Return the best (largest, non-stripped, non-progressive, non-empty) photo size.
+ * Telegram quality tiers: w > y > d > x > c > m > b > a > s
  */
-function pickBestPhotoSize(sizes) {
+function pickBestSize(sizes) {
   if (!sizes || sizes.length === 0) return null;
-  // Prefer types in descending quality order
-  const preferOrder = ['w', 'y', 'd', 'x', 'c', 'm', 'b', 'a', 's'];
-  for (const t of preferOrder) {
+  for (const t of ['w', 'y', 'd', 'x', 'c', 'm', 'b', 'a', 's']) {
     const s = sizes.find(sz =>
       sz.type === t &&
       !(sz instanceof Api.PhotoStrippedSize) &&
@@ -111,226 +98,141 @@ function pickBestPhotoSize(sizes) {
     );
     if (s) return s;
   }
-  // Fallback: any non-stripped, non-empty
   return sizes.find(sz =>
     !(sz instanceof Api.PhotoStrippedSize) &&
     !(sz instanceof Api.PhotoSizeEmpty)
   ) || null;
 }
 
+// ─── MTProto image download ───────────────────────────────────────────────────
 /**
- * Attempt 1 — GramJS downloadFileV2 via InputPhotoFileLocation.
- * Builds the TL location manually to avoid the stripped-size bug in downloadMedia.
+ * Get the entity for a peer — works for PeerUser, PeerChat, PeerChannel.
+ * GramJS handles all three cases when you pass the peerId directly.
  */
-async function downloadViaMTProto(client, photo, destPath) {
-  const size = pickBestPhotoSize(photo.sizes);
-  if (!size) throw new Error('No usable photo size in TL photo object');
+async function getEntitySafe(client, peerId) {
+  try {
+    return await client.getEntity(peerId);
+  } catch (e) {
+    // Last resort: use the peer object directly (works for most cases)
+    console.warn(`[DL] getEntity failed (${e.message}), using peerId directly`);
+    return peerId;
+  }
+}
 
-  console.log(`[DL-1] MTProto InputPhotoFileLocation type=${size.type} dcId=${photo.dcId}`);
+/**
+ * Re-fetch the message to get a fresh fileReference, then download via
+ * GramJS downloadFileV2 with an explicit InputPhotoFileLocation.
+ *
+ * This avoids two bugs:
+ *   a) Stale fileReference in the event message → AUTH_BYTES_INVALID
+ *   b) downloadMedia picking PhotoStrippedSize → 0-byte file
+ */
+async function downloadViaMTProto(client, originalMsg, destPath) {
+  console.log('[DL-1] Re-fetching message for fresh fileReference...');
 
-  const fileLocation = new Api.InputPhotoFileLocation({
+  const entity = await getEntitySafe(client, originalMsg.peerId);
+
+  // Re-fetch to get fresh fileReference
+  const msgs = await client.getMessages(entity, { ids: [originalMsg.id] });
+  const freshMsg = msgs && msgs[0];
+
+  if (!freshMsg || !freshMsg.media) {
+    throw new Error('Re-fetched message has no media');
+  }
+
+  const photo = freshMsg.media.photo;
+  if (!photo || photo instanceof Api.PhotoEmpty) {
+    throw new Error('Re-fetched message has no valid photo');
+  }
+
+  const size = pickBestSize(photo.sizes);
+  if (!size) throw new Error('Photo has no usable size');
+
+  console.log(`[DL-1] Downloading: type=${size.type} dcId=${photo.dcId}`);
+
+  const location = new Api.InputPhotoFileLocation({
     id:            photo.id,
     accessHash:    photo.accessHash,
     fileReference: photo.fileReference,
     thumbSize:     size.type,
   });
 
-  const fileSize = 'size' in size
-    ? bigInt(size.size)
-    : bigInt(512 * 1024); // safe fallback estimate
+  const fileSizeBi = 'size' in size ? bigInt(size.size) : bigInt(512 * 1024);
 
-  await downloadFileV2(client, fileLocation, {
+  await downloadFileV2(client, location, {
     outputFile: destPath,
-    fileSize,
-    dcId: photo.dcId,
-  });
-
-  if (!fs.existsSync(destPath)) throw new Error('File not written');
-  const bytes = fs.statSync(destPath).size;
-  if (bytes === 0) throw new Error('Downloaded file is 0 bytes');
-  console.log(`[DL-1] MTProto success — ${bytes} bytes`);
-}
-
-/**
- * Attempt 2 — Bot API getFile → HTTPS stream.
- * Uses Bot API to resolve a file_id to a download URL, then streams it.
- * This always works for bots regardless of DC or file reference freshness.
- *
- * To get the Bot API file_id we call Bot API getUpdates is NOT available
- * during long-polling conflicts — instead we use a trick:
- * forward the message to ourselves to get a fresh file_id from Bot API.
- *
- * Simpler approach: call Bot API sendDocument/getFile with the message's
- * photo directly. Since we're a bot, we can use the message_id + chat_id
- * to call Bot API copyMessage and get file_id — but that's wasteful.
- *
- * THE REAL TRICK: GramJS photo.id is NOT the Bot API file_id.
- * But we can encode a Bot API file_id from the TL photo using the
- * standard Telegram encoding scheme (type 2 = photo).
- * Format: pack(type, dc_id, id, access_hash, file_reference) → base64url
- *
- * This is what python-telegram-bot, aiogram etc. all do internally.
- */
-
-/**
- * Encode a Bot API file_id from a TL Photo object.
- * Telegram Bot API file_id encoding for photos (type_id = 2):
- *   byte  0:     file_type (2 = photo)
- *   byte  1:     dc_id
- *   bytes 2-9:   id (int64 LE)
- *   bytes 10-17: access_hash (int64 LE)
- *   byte  18:    len(file_reference)
- *   bytes 19+:   file_reference bytes
- *   byte  19+N:  thumbnail type byte (e.g. 'y'.charCodeAt(0))
- * Then base64url encode the whole thing.
- */
-function encodePhotoFileId(photo, thumbType) {
-  const fileRef  = Buffer.isBuffer(photo.fileReference)
-    ? photo.fileReference
-    : Buffer.from(photo.fileReference);
-
-  // Pack id and access_hash as signed int64 LE (BigInt → Buffer)
-  function bigIntToLE8(bi) {
-    // Handle both native BigInt and big-integer library
-    const hex = (typeof bi === 'bigint' ? bi : BigInt(bi.toString()))
-      .toString(16)
-      .replace('-', '');
-    const padded = hex.padStart(16, '0');
-    const buf = Buffer.from(padded, 'hex');
-    buf.reverse();
-    return buf;
-  }
-
-  const typeFlag   = Buffer.from([2, photo.dcId]);             // type=photo, dcId
-  const idBuf      = bigIntToLE8(photo.id);
-  const hashBuf    = bigIntToLE8(photo.accessHash);
-  const refLen     = Buffer.from([fileRef.length]);
-  const thumbBuf   = Buffer.from([thumbType.charCodeAt(0)]);
-
-  const combined = Buffer.concat([typeFlag, idBuf, hashBuf, refLen, fileRef, thumbBuf]);
-  return combined.toString('base64')
-    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-}
-
-/**
- * Download via Bot API: encode file_id → getFile → HTTPS stream.
- */
-async function downloadViaBotApi(photo, thumbType, destPath) {
-  console.log(`[DL-2] Bot API getFile...`);
-
-  let fileId;
-  try {
-    fileId = encodePhotoFileId(photo, thumbType);
-  } catch (e) {
-    throw new Error(`file_id encoding failed: ${e.message}`);
-  }
-
-  // Call Bot API getFile
-  const fileInfo = await new Promise((resolve, reject) => {
-    const body = JSON.stringify({ file_id: fileId });
-    const req = https.request({
-      hostname: 'api.telegram.org',
-      path:     `/bot${BOT_TOKEN}/getFile`,
-      method:   'POST',
-      headers:  { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
-    }, (res) => {
-      let d = '';
-      res.on('data', c => d += c);
-      res.on('end', () => {
-        try {
-          const p = JSON.parse(d);
-          if (p.ok) resolve(p.result);
-          else reject(new Error(`getFile API error: ${p.description}`));
-        } catch (e) { reject(e); }
-      });
-    });
-    req.on('error', reject);
-    req.setTimeout(10000, () => req.destroy(new Error('getFile timeout')));
-    req.write(body);
-    req.end();
-  });
-
-  if (!fileInfo.file_path) throw new Error('getFile returned no file_path');
-
-  const downloadUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.file_path}`;
-  console.log(`[DL-2] Streaming from Bot API URL...`);
-
-  // Stream to disk
-  await new Promise((resolve, reject) => {
-    const fileStream = fs.createWriteStream(destPath);
-    https.get(downloadUrl, (res) => {
-      if (res.statusCode !== 200) {
-        reject(new Error(`HTTP ${res.statusCode} downloading file`));
-        return;
-      }
-      res.pipe(fileStream);
-      fileStream.on('finish', () => fileStream.close(resolve));
-      fileStream.on('error', reject);
-    }).on('error', reject)
-      .setTimeout(30000, function() { this.destroy(new Error('Download timeout')); });
+    fileSize:   fileSizeBi,
+    dcId:       photo.dcId,
   });
 
   const bytes = fs.existsSync(destPath) ? fs.statSync(destPath).size : 0;
-  if (bytes === 0) throw new Error('Bot API download produced 0 bytes');
-  console.log(`[DL-2] Bot API success — ${bytes} bytes`);
+  if (bytes === 0) throw new Error('downloadFileV2 produced 0 bytes');
+  console.log(`[DL-1] Success: ${bytes} bytes`);
 }
 
 /**
- * Master download function — tries MTProto first, Bot API second.
+ * Fallback: use client.downloadMedia() on the re-fetched message.
+ * GramJS handles DC export auth internally.
+ */
+async function downloadViaDownloadMedia(client, originalMsg, destPath) {
+  console.log('[DL-2] Trying client.downloadMedia() on re-fetched message...');
+
+  const entity  = await getEntitySafe(client, originalMsg.peerId);
+  const msgs    = await client.getMessages(entity, { ids: [originalMsg.id] });
+  const freshMsg = msgs && msgs[0];
+
+  if (!freshMsg || !freshMsg.media) {
+    throw new Error('Re-fetched message has no media');
+  }
+
+  const result = await client.downloadMedia(freshMsg, { outputFile: destPath });
+
+  const bytes = fs.existsSync(destPath) ? fs.statSync(destPath).size : 0;
+  if (bytes === 0) throw new Error('downloadMedia produced 0 bytes');
+  console.log(`[DL-2] Success: ${bytes} bytes`);
+}
+
+/**
+ * Master download: try downloadFileV2 first, fall back to downloadMedia.
+ * Both are pure MTProto — no HTTP, no Bot API.
  */
 async function downloadImage(client, msg, destPath) {
-  // Extract the TL Photo object
-  const media = msg.media;
-  if (!media) throw new Error('Message has no media');
+  if (!msg.media) throw new Error('Message has no media');
 
-  let photo = null;
-  if (media instanceof Api.MessageMediaPhoto) {
-    photo = media.photo;
-  } else if (media instanceof Api.Photo) {
-    photo = media;
-  }
-
-  if (!photo || photo instanceof Api.PhotoEmpty) {
-    throw new Error('Message media contains no valid photo');
-  }
-
-  const bestSize = pickBestPhotoSize(photo.sizes);
-  if (!bestSize) throw new Error('Photo has no usable sizes');
-  const thumbType = bestSize.type || 'y';
-
-  // Attempt 1: MTProto
+  // Attempt 1: downloadFileV2 with explicit location (avoids stripped-size bug)
   try {
-    await downloadViaMTProto(client, photo, destPath);
+    await downloadViaMTProto(client, msg, destPath);
     return;
   } catch (e1) {
-    console.warn(`[DL-1] MTProto failed: ${e1.message} — trying Bot API...`);
+    console.warn(`[DL-1] Failed: ${e1.message}`);
     try { fs.unlinkSync(destPath); } catch (_) {}
   }
 
-  // Attempt 2: Bot API
+  // Attempt 2: GramJS downloadMedia on re-fetched message
   try {
-    await downloadViaBotApi(photo, thumbType, destPath);
+    await downloadViaDownloadMedia(client, msg, destPath);
     return;
   } catch (e2) {
-    console.error(`[DL-2] Bot API failed: ${e2.message}`);
-    throw new Error(`All download methods failed. MTProto: ${e2.message}`);
+    console.error(`[DL-2] Failed: ${e2.message}`);
+    try { fs.unlinkSync(destPath); } catch (_) {}
+    throw new Error(`All MTProto download attempts failed. Last: ${e2.message}`);
   }
 }
 
 // ─── Caption helpers ──────────────────────────────────────────────────────────
 /**
- * Returns { gridSize: 8|10 } if caption contains a recognised challenge phrase,
- * or null if the message should be ignored.
+ * Returns { gridSize: 8|10 } if caption contains a recognised trigger phrase,
+ * otherwise null (message is silently ignored).
  *   "WORD GRID CHALLENGE" → 8×8
  *   "HARD MODE CHALLENGE" → 10×10
  */
 function getChallengeInfo(text) {
-  const upper = text.toUpperCase();
-  if (upper.includes('WORD GRID CHALLENGE')) {
+  const u = text.toUpperCase();
+  if (u.includes('WORD GRID CHALLENGE')) {
     console.log('[Trigger] WORD GRID CHALLENGE → 8×8');
     return { gridSize: 8 };
   }
-  if (upper.includes('HARD MODE CHALLENGE')) {
+  if (u.includes('HARD MODE CHALLENGE')) {
     console.log('[Trigger] HARD MODE CHALLENGE → 10×10');
     return { gridSize: 10 };
   }
@@ -338,21 +240,17 @@ function getChallengeInfo(text) {
 }
 
 /**
- * Parse word patterns from caption — single left-to-right pass.
- * Handles: "M--- (4)", "M----", "W---- H--- (4)", mixed prose.
+ * Extract word patterns from caption text — left-to-right, single pass.
+ * Supports: "M--- (4)", "M----", "W---- H--- (4)", mixed prose.
  */
 function parsePatterns(text) {
-  const results = [];
-  const seen    = new Set();
-  const re      = /([A-Z])(-+)(?:\s*\(\d+\))?/g;
+  const results = [], seen = new Set();
+  const re = /([A-Z])(-+)(?:\s*\(\d+\))?/g;
   let m;
   while ((m = re.exec(text)) !== null) {
     if (m[2].length < 2) continue;
     const pattern = (m[1] + m[2]).toUpperCase();
-    if (!seen.has(pattern)) {
-      seen.add(pattern);
-      results.push({ pattern });
-    }
+    if (!seen.has(pattern)) { seen.add(pattern); results.push({ pattern }); }
   }
   return results;
 }
@@ -363,10 +261,10 @@ function formatResults(results, grid, patterns) {
   let foundAny = false;
 
   for (const p of patterns) {
-    const key = p.pattern || p.word;
+    const key   = p.pattern || p.word;
     if (!key) continue;
-
     const entry = results[key];
+
     if (!entry) {
       msg += `❓ ${key}: not found\n`;
       continue;
@@ -381,7 +279,7 @@ function formatResults(results, grid, patterns) {
         if (isWord(raw)) { wordMatches.add(raw); continue; }
         const forced = startChar + raw.slice(1);
         if (isWord(forced)) { wordMatches.add(forced); continue; }
-        console.log(`[Debug] Rejected non-word for "${key}": ${raw}`);
+        console.log(`[Debug] Rejected: ${key} → ${raw}`);
       }
 
       if (wordMatches.size > 0) {
@@ -389,7 +287,7 @@ function formatResults(results, grid, patterns) {
         stats.wordsFound += wordMatches.size;
         foundAny = true;
       } else {
-        msg += `❓ ${key}: no dictionary words matched\n`;
+        msg += `❓ ${key}: no dictionary words found\n`;
       }
     } else {
       msg += `✅ <code>${entry.match}</code> @ [${entry.r},${entry.c}] ${entry.dir}\n`;
@@ -399,7 +297,7 @@ function formatResults(results, grid, patterns) {
 
   if (!foundAny) {
     msg += '😔 No real word matches found.\n';
-    msg += 'Tip: verify caption patterns match grid letters.\n';
+    msg += 'Tip: verify caption patterns match the grid letters.\n';
   }
 
   msg += '\n🔍 <b>Extracted Grid:</b>\n';
@@ -410,8 +308,7 @@ function formatResults(results, grid, patterns) {
 // ─── GramJS Bot ───────────────────────────────────────────────────────────────
 async function startBot() {
   const session = new StringSession('');
-
-  const client = new TelegramClient(session, API_ID, API_HASH, {
+  const client  = new TelegramClient(session, API_ID, API_HASH, {
     connectionRetries: 10,
     retryDelay:        2000,
     autoReconnect:     true,
@@ -434,7 +331,7 @@ async function startBot() {
     const chatId  = msg.peerId;
     const caption = (msg.message || '').trim();
 
-    // /start
+    // /start command
     if (caption === '/start' || caption.startsWith('/start ')) {
       await client.sendMessage(chatId, {
         message: [
@@ -442,21 +339,23 @@ async function startBot() {
           '',
           'Send a word grid image with the challenge caption and word patterns.',
           '',
-          '<b>Triggers:</b>',
+          '<b>Triggers (case-insensitive):</b>',
           '• <code>WORD GRID CHALLENGE</code> → solves 8×8 grid',
           '• <code>HARD MODE CHALLENGE</code>  → solves 10×10 grid',
           '',
-          '<b>Add word patterns in the caption:</b>',
-          '<code>WORD GRID CHALLENGE\nM--- (4) P------- (8) S----- (6)</code>',
+          '<b>Example caption:</b>',
+          '<code>WORD GRID CHALLENGE\nM--- (4) P------- (8) C----- (6)</code>',
+          '',
+          'The bot only processes images with these exact trigger phrases.',
         ].join('\n'),
         parseMode: 'html',
       });
       return;
     }
 
-    // ── Gate: only recognised challenge captions ───────────────────────────────
+    // ── Gate: only act on challenge captions ───────────────────────────────────
     const challenge = getChallengeInfo(caption);
-    if (!challenge) return; // silently ignore
+    if (!challenge) return; // silently ignore everything else
 
     // ── Must carry a photo ─────────────────────────────────────────────────────
     const hasPhoto = msg.media && (
@@ -473,7 +372,7 @@ async function startBot() {
       return;
     }
 
-    // ── Download ───────────────────────────────────────────────────────────────
+    // ── Download image ─────────────────────────────────────────────────────────
     const imagePath = path.join(
       __dirname,
       `grid_${Date.now()}_${Math.random().toString(36).slice(2)}.jpg`
@@ -504,7 +403,7 @@ async function startBot() {
 
       if (!grid || grid.length === 0) {
         await client.sendMessage(chatId, {
-          message: '❌ Could not read the grid from the image. Make sure letters are clearly visible.',
+          message: '❌ Could not read the grid from the image.\nMake sure the letters are clearly visible.',
         });
         return;
       }
@@ -512,22 +411,27 @@ async function startBot() {
       const patterns = parsePatterns(caption);
 
       if (patterns.length === 0) {
-        const noPatMsg =
-          `📋 <b>${challenge.gridSize}×${challenge.gridSize} grid extracted</b> ` +
-          `(no word patterns in caption):\n\n` +
-          '<pre>' + grid.map(r => r.join(' ')).join('\n') + '</pre>\n\n' +
-          'Add patterns like <code>M--- (4)</code> to find words!';
-        await client.sendMessage(chatId, { message: noPatMsg, parseMode: 'html' });
+        await client.sendMessage(chatId, {
+          message:
+            `📋 <b>${challenge.gridSize}×${challenge.gridSize} grid extracted</b> (no patterns found):\n\n` +
+            '<pre>' + grid.map(r => r.join(' ')).join('\n') + '</pre>\n\n' +
+            'Add patterns like <code>M--- (4)</code> to find words!',
+          parseMode: 'html',
+        });
         return;
       }
 
       const results = solve(grid, patterns);
-      const reply   = formatResults(results, grid, patterns);
-      await client.sendMessage(chatId, { message: reply, parseMode: 'html' });
+      await client.sendMessage(chatId, {
+        message:   formatResults(results, grid, patterns),
+        parseMode: 'html',
+      });
 
     } catch (err) {
       console.error('[Handler] Error:', err);
-      await client.sendMessage(chatId, { message: '🚨 Processing error. Please try again.' });
+      await client.sendMessage(chatId, {
+        message: '🚨 Processing error. Please try again.',
+      });
     } finally {
       await deleteFile(imagePath);
     }
@@ -536,7 +440,7 @@ async function startBot() {
 
   console.log('[Bot] Listening for messages...');
 
-  const shutdown = async (sig) => {
+  const shutdown = async sig => {
     console.log(`[Bot] ${sig} — disconnecting...`);
     try { await client.disconnect(); } catch (_) {}
     process.exit(0);
@@ -556,7 +460,4 @@ app.get('/api/stats', (_req, res) => {
 app.listen(PORT, () => console.log(`[Dashboard] Running on port ${PORT}`));
 
 // ─── Boot ─────────────────────────────────────────────────────────────────────
-startBot().catch(err => {
-  console.error('[FATAL]', err);
-  process.exit(1);
-});
+startBot().catch(err => { console.error('[FATAL]', err); process.exit(1); });
