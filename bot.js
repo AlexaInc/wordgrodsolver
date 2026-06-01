@@ -372,67 +372,91 @@ async function startBot() {
       return;
     }
 
-    // ── Download image ─────────────────────────────────────────────────────────
+    // ── Download + OCR + Solve (all in one guarded block) ─────────────────────
     const imagePath = path.join(
       __dirname,
       `grid_${Date.now()}_${Math.random().toString(36).slice(2)}.jpg`
     );
 
-    try {
-      await client.sendMessage(chatId, {
-        message: `🔍 Processing your ${challenge.gridSize}×${challenge.gridSize} word grid...`,
-      });
+    // Safe send — never throws, logs errors instead
+    const safeSend = async (text, opts = {}) => {
+      try {
+        await client.sendMessage(chatId, { message: text, ...opts });
+      } catch (sendErr) {
+        console.error('[safeSend] Failed to send message:', sendErr.message);
+        // Try plain text fallback if HTML parse failed
+        if (opts.parseMode) {
+          try {
+            const plain = text.replace(/<[^>]+>/g, '');
+            await client.sendMessage(chatId, { message: plain });
+          } catch (_) {}
+        }
+      }
+    };
 
+    try {
+      await safeSend(
+        `🔍 Processing your ${challenge.gridSize}×${challenge.gridSize} word grid...`
+      );
+
+      // ── Step 1: Download ────────────────────────────────────────────────────
+      console.log(`[Handler] Starting download for msg=${msg.id}`);
       await downloadImage(client, msg, imagePath);
+      console.log(`[Handler] Download complete: ${imagePath}`);
 
-    } catch (dlErr) {
-      console.error('[Download] Failed:', dlErr.message);
-      console.error(dlErr.stack);
-      await client.sendMessage(chatId, {
-        message: `❌ Could not download image: ${dlErr.message}`,
-      });
-      await deleteFile(imagePath);
-      return;
-    }
-
-    // ── OCR + Solve ────────────────────────────────────────────────────────────
-    try {
+      // ── Step 2: OCR ─────────────────────────────────────────────────────────
       stats.imagesProcessed++;
+      console.log(`[Handler] Starting OCR (${challenge.gridSize}×${challenge.gridSize})...`);
 
-      const grid = await extractGrid(imagePath, challenge.gridSize);
+      let grid;
+      try {
+        grid = await extractGrid(imagePath, challenge.gridSize);
+      } catch (ocrErr) {
+        console.error('[Handler] OCR threw:', ocrErr.message, ocrErr.stack);
+        grid = null;
+      }
 
       if (!grid || grid.length === 0) {
-        await client.sendMessage(chatId, {
-          message: '❌ Could not read the grid from the image.\nMake sure the letters are clearly visible.',
-        });
+        console.warn('[Handler] OCR returned null/empty grid');
+        await safeSend(
+          '❌ Could not read the grid from this image.\n' +
+          'Make sure the letters are clearly visible and the image is not blurry.'
+        );
         return;
       }
 
+      console.log(`[Handler] OCR done — ${grid.length}×${grid[0].length} grid`);
+
+      // ── Step 3: Parse patterns ───────────────────────────────────────────────
       const patterns = parsePatterns(caption);
+      console.log(`[Handler] Patterns: ${patterns.map(p => p.pattern).join(', ') || '(none)'}`);
 
       if (patterns.length === 0) {
-        await client.sendMessage(chatId, {
-          message:
-            `📋 <b>${challenge.gridSize}×${challenge.gridSize} grid extracted</b> (no patterns found):\n\n` +
-            '<pre>' + grid.map(r => r.join(' ')).join('\n') + '</pre>\n\n' +
-            'Add patterns like <code>M--- (4)</code> to find words!',
-          parseMode: 'html',
-        });
+        // Show grid even without patterns
+        const gridText = '<pre>' + grid.map(r => r.join(' ')).join('\n') + '</pre>';
+        await safeSend(
+          `📋 <b>${challenge.gridSize}×${challenge.gridSize} grid extracted</b> (no patterns found):\n\n` +
+          gridText + '\n\nAdd patterns like <code>M--- (4)</code> to find words!',
+          { parseMode: 'html' }
+        );
         return;
       }
 
+      // ── Step 4: Solve ────────────────────────────────────────────────────────
+      console.log('[Handler] Solving...');
       const results = solve(grid, patterns);
-      await client.sendMessage(chatId, {
-        message:   formatResults(results, grid, patterns),
-        parseMode: 'html',
-      });
+      const reply   = formatResults(results, grid, patterns);
+
+      await safeSend(reply, { parseMode: 'html' });
+      console.log('[Handler] Done ✓');
 
     } catch (err) {
-      console.error('[Handler] Error:', err);
-      await client.sendMessage(chatId, {
-        message: '🚨 Processing error. Please try again.',
-      });
+      // Catch-all for download errors and any unexpected throws
+      console.error('[Handler] Unhandled error:', err.message);
+      console.error(err.stack);
+      await safeSend(`❌ Error: ${err.message}`);
     } finally {
+      // Always clean up the temp file
       await deleteFile(imagePath);
     }
 

@@ -1,37 +1,36 @@
 /**
- * ocr.js — Dual-pass Tesseract OCR: 100% accurate on both 8×8 and 10×10 grids
+ * ocr.js — Dual-pass Tesseract OCR for word grid images
  *
- * Strategy (proven 100% accuracy on both test images):
+ * Supports BOTH colour schemes automatically:
+ *   • Light background, dark letters  (white/grey BG, black letters)
+ *   • Dark background, light letters  (black BG, white letters)
  *
- *   Pass A — Full-image PSM 6 (uniform text block), 4 thresholds
+ * Strategy:
+ *   Pass A — Full-image PSM 6 (uniform text block), multiple thresholds
  *     • Crops the border first (removes outer frame noise)
- *     • Maps each detected symbol to its grid cell by pixel position
- *     • Votes: weight 1 per hit
+ *     • Maps each detected symbol bbox-centre to its grid cell
+ *     • Weight 1 per vote
  *
- *   Pass B — Cell-by-cell PSM 10 (single character), 5 thresholds
- *     • Extracts each cell individually (80% of cell area, centered)
- *     • Upscales 3× before OCR for sharper character recognition
- *     • Votes: weight 2 per hit (more reliable, higher weight)
+ *   Pass B — Cell-by-cell PSM 10 (single character), multiple thresholds
+ *     • Extracts each cell individually, 3× upscaled
+ *     • Weight 2 per vote (cell-level is more reliable)
  *
- *   Final grid — majority vote across both passes per cell
+ *   Final — majority vote per cell across both passes
  *
- * Grid size:
- *   • Pass the size explicitly (8 or 10) — determined from caption keyword
- *   • If forcedSize is null, auto-detect from symbol density
- *
- * Border detection:
- *   • Grid border ≈ 5.5% of min(width,height) — measured empirically on both
- *     the 452×452 (8×8) and 516×516 (10×10) standard Telegram game images
+ * Background detection:
+ *   Samples the mean pixel value of the border region.
+ *   If mean < 128 → dark background → negate before thresholding
+ *   so Tesseract always receives black-text-on-white.
  */
 
 'use strict';
 
-const sharp          = require('sharp');
+const sharp            = require('sharp');
 sharp.cache(false);
 const { createWorker } = require('tesseract.js');
 
-// ─── Non-alpha → letter corrections ───────────────────────────────────────────
-// Only map digits/symbols that Tesseract might emit instead of capital letters.
+// ─── Character normalisation ───────────────────────────────────────────────────
+// Map digits/symbols Tesseract sometimes emits to their closest letter.
 // We never remap one letter to another — that is the solver's job.
 const CHAR_MAP = {
   '0': 'O', '1': 'I', '2': 'Z', '3': 'B',
@@ -45,7 +44,7 @@ function clean(ch) {
   return CHAR_MAP[u] || null;
 }
 
-// ─── Merge vote maps ───────────────────────────────────────────────────────────
+// ─── Vote helpers ──────────────────────────────────────────────────────────────
 function mergeVotes(a, b) {
   const out = { ...a };
   for (const [ch, v] of Object.entries(b)) out[ch] = (out[ch] || 0) + v;
@@ -60,40 +59,111 @@ function pickWinner(votes) {
   return best;
 }
 
-// ─── Pass A: full-image OCR (PSM 6) ───────────────────────────────────────────
+// ─── Background detection ──────────────────────────────────────────────────────
 /**
- * Runs Tesseract PSM 6 on the full (border-cropped) image.
- * Maps each symbol bounding-box centre to a grid cell by dividing
- * the cropped image into an NxN grid of equal cells.
+ * Detect whether the image has a dark background.
+ * Samples a thin ring just inside the border region and computes mean luminance.
+ * Returns true if background is dark (mean < 128) → need to negate for Tesseract.
  *
- * @returns {Object[][][]}  votesA[r][c] = { 'A': n, ... }
+ * @param {string} imgPath
+ * @param {number} border   – border thickness in pixels
+ * @returns {Promise<boolean>}
  */
-async function passA(worker, imgPath, gridSize, border) {
+async function isDarkBackground(imgPath, border) {
+  try {
+    const meta  = await sharp(imgPath).metadata();
+    const W = meta.width, H = meta.height;
+
+    // Sample the four corner cells of the grid border area
+    // Use a small strip just inside the outer border
+    const sampleSize = Math.max(4, Math.round(border * 0.8));
+
+    // Top-left corner sample
+    const sample = await sharp(imgPath)
+      .extract({
+        left:   Math.max(0, border - sampleSize),
+        top:    Math.max(0, border - sampleSize),
+        width:  sampleSize * 2,
+        height: sampleSize * 2,
+      })
+      .grayscale()
+      .raw()
+      .toBuffer();
+
+    const mean = sample.reduce((s, v) => s + v, 0) / sample.length;
+    const dark = mean < 128;
+    console.log(`[OCR] Background mean luminance: ${mean.toFixed(1)} → ${dark ? 'DARK (will negate)' : 'LIGHT'}`);
+    return dark;
+  } catch (e) {
+    console.warn('[OCR] Background detection failed, assuming light:', e.message);
+    return false;
+  }
+}
+
+// ─── Sharp pipeline builder ────────────────────────────────────────────────────
+/**
+ * Build a preprocessed image buffer from a region of the source image.
+ * Handles both light and dark backgrounds:
+ *   - Dark BG: negate BEFORE threshold so letters become dark on light BG
+ *   - Light BG: threshold directly
+ *
+ * @param {string}  imgPath
+ * @param {object}  region      – { left, top, width, height }
+ * @param {number}  threshold   – binarisation threshold (0-255)
+ * @param {boolean} darkBg      – true if image has dark background
+ * @param {number}  scale       – upscale factor (1 = no scaling)
+ * @returns {Promise<Buffer>}
+ */
+async function buildBuf(imgPath, region, threshold, darkBg, scale = 1) {
+  let pipeline = sharp(imgPath).extract(region).grayscale().normalize();
+
+  if (darkBg) {
+    // Negate so white letters become black — Tesseract needs black text on white
+    pipeline = pipeline.negate();
+  }
+
+  pipeline = pipeline.sharpen({ sigma: 1.2 });
+
+  if (scale > 1) {
+    pipeline = pipeline.resize(
+      region.width  * scale,
+      region.height * scale,
+      { kernel: 'lanczos3' }
+    );
+  }
+
+  pipeline = pipeline.threshold(threshold);
+  return pipeline.toBuffer();
+}
+
+// ─── Pass A: full-image OCR (PSM 6) ───────────────────────────────────────────
+async function passA(worker, imgPath, gridSize, border, darkBg) {
   const meta = await sharp(imgPath).metadata();
   const W = meta.width, H = meta.height;
 
   const cropL = border, cropT = border;
-  const cropW = W - 2 * border, cropH = H - 2 * border;
-  const cellW = cropW / gridSize, cellH = cropH / gridSize;
+  const cropW = W - 2 * border;
+  const cropH = H - 2 * border;
+  const cellW = cropW / gridSize;
+  const cellH = cropH / gridSize;
 
   const votes = Array.from({ length: gridSize }, () =>
     Array.from({ length: gridSize }, () => ({}))
   );
 
+  // Use thresholds on the light side — after negate (dark BG) or direct (light BG)
   const THRESHOLDS = [80, 110, 140, 170];
 
   for (const th of THRESHOLDS) {
     let buf;
     try {
-      buf = await sharp(imgPath)
-        .extract({ left: cropL, top: cropT, width: cropW, height: cropH })
-        .grayscale()
-        .normalize()
-        .sharpen({ sigma: 1 })
-        .threshold(th)
-        .toBuffer();
+      buf = await buildBuf(
+        imgPath,
+        { left: cropL, top: cropT, width: cropW, height: cropH },
+        th, darkBg, 1
+      );
     } catch (e) {
-      console.warn(`[PassA] sharp th=${th}: ${e.message}`);
+      console.warn(`[PassA] preprocess th=${th}: ${e.message}`);
       continue;
     }
 
@@ -122,21 +192,17 @@ async function passA(worker, imgPath, gridSize, border) {
 }
 
 // ─── Pass B: cell-by-cell OCR (PSM 10) ────────────────────────────────────────
-/**
- * Extracts each grid cell individually (padded 10% inward, 3× upscaled).
- * Uses PSM 10 (single character) which is most accurate for isolated letters.
- * Weights each vote by 2 (more reliable than full-image pass).
- *
- * @returns {Object[][][]}  votesB[r][c] = { 'A': n, ... }
- */
-async function passB(worker, imgPath, gridSize, border) {
+async function passB(worker, imgPath, gridSize, border, darkBg) {
   const meta = await sharp(imgPath).metadata();
   const W = meta.width, H = meta.height;
 
-  const innerW = W - 2 * border, innerH = H - 2 * border;
-  const cellW  = innerW / gridSize, cellH = innerH / gridSize;
+  const innerW = W - 2 * border;
+  const innerH = H - 2 * border;
+  const cellW  = innerW / gridSize;
+  const cellH  = innerH / gridSize;
+
   const PAD    = 0.10; // 10% inset from each cell edge
-  const SCALE  = 3;    // upscale factor for sharper OCR
+  const SCALE  = 3;    // upscale for sharper OCR
   const WEIGHT = 2;    // cell-level votes count double
 
   const THRESHOLDS = [80, 110, 140, 170, 200];
@@ -155,14 +221,7 @@ async function passB(worker, imgPath, gridSize, border) {
       for (const th of THRESHOLDS) {
         let buf;
         try {
-          buf = await sharp(imgPath)
-            .extract({ left, top, width, height })
-            .grayscale()
-            .normalize()
-            .resize(width * SCALE, height * SCALE, { kernel: 'lanczos3' })
-            .sharpen({ sigma: 1.5 })
-            .threshold(th)
-            .toBuffer();
+          buf = await buildBuf(imgPath, { left, top, width, height }, th, darkBg, SCALE);
         } catch (e) {
           continue;
         }
@@ -174,7 +233,8 @@ async function passB(worker, imgPath, gridSize, border) {
           continue;
         }
 
-        const ch = clean(res.data.text.replace(/[^A-Za-z0-9|]/g, '').charAt(0));
+        const rawCh = (res.data.text || '').replace(/[^A-Za-z0-9|]/g, '').charAt(0);
+        const ch    = clean(rawCh);
         if (ch && res.data.confidence > 15) {
           votes[r][c][ch] = (votes[r][c][ch] || 0) + WEIGHT;
         }
@@ -186,39 +246,41 @@ async function passB(worker, imgPath, gridSize, border) {
 }
 
 // ─── Auto-detect grid size ─────────────────────────────────────────────────────
-/**
- * Run a quick PSM 6 pass at one threshold and count symbols.
- * >160 observations → likely 10×10, else 8×8.
- */
-async function autoDetectSize(imgPath, border) {
+async function autoDetectSize(imgPath, border, darkBg) {
   const meta = await sharp(imgPath).metadata();
   const W = meta.width, H = meta.height;
 
-  const buf = await sharp(imgPath)
-    .extract({ left: border, top: border, width: W - 2*border, height: H - 2*border })
-    .grayscale()
-    .normalize()
-    .threshold(130)
-    .toBuffer();
+  let buf;
+  try {
+    buf = await buildBuf(
+      imgPath,
+      { left: border, top: border, width: W - 2 * border, height: H - 2 * border },
+      130, darkBg, 1
+    );
+  } catch (e) {
+    console.warn('[OCR] autoDetect preprocess failed:', e.message);
+    return 8;
+  }
 
   const worker = await createWorker('eng');
   await worker.setParameters({
     tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ',
-    tessedit_pageseg_mode: '6',
+    tessedit_pageseg_mode:   '6',
   });
   const res = await worker.recognize(buf);
   await worker.terminate();
 
   const count = (res.data.symbols || []).filter(s => /^[A-Z]$/i.test(s.text)).length;
-  console.log(`[OCR] Auto-detect: ${count} symbols → ${count > 160 ? 10 : 8}×${count > 160 ? 10 : 8}`);
-  return count > 160 ? 10 : 8;
+  const size  = count > 160 ? 10 : 8;
+  console.log(`[OCR] Auto-detect: ${count} symbols → ${size}×${size}`);
+  return size;
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 /**
  * @param {string}      imagePath
- * @param {number|null} forcedSize  – 8 or 10 from caption keyword; null = auto
- * @returns {string[][]|null}
+ * @param {number|null} forcedSize   – 8 or 10; null = auto-detect
+ * @returns {Promise<string[][]|null>}
  */
 async function extractGrid(imagePath, forcedSize = null) {
   let workerA = null;
@@ -227,48 +289,133 @@ async function extractGrid(imagePath, forcedSize = null) {
   try {
     const meta   = await sharp(imagePath).metadata();
     const minDim = Math.min(meta.width, meta.height);
-    const border = Math.round(minDim * 0.055); // ~5.5% border on each side
+    const border = Math.round(minDim * 0.055);
 
     console.log(`[OCR] Image ${meta.width}×${meta.height}, border=${border}px`);
 
-    // Determine grid size
-    const gridSize = forcedSize !== null
+    // ── Detect background colour scheme ──────────────────────────────────────
+    const darkBg = await isDarkBackground(imagePath, border);
+
+    // ── Determine grid size ───────────────────────────────────────────────────
+    const gridSize = (forcedSize !== null)
       ? forcedSize
-      : await autoDetectSize(imagePath, border);
+      : await autoDetectSize(imagePath, border, darkBg);
 
     console.log(`[OCR] Grid size: ${gridSize}×${gridSize}`);
 
-    // ── Worker A: PSM 6 for full-image pass ──────────────────────────────────
+    // ── Pass A: full-image PSM 6 ──────────────────────────────────────────────
     workerA = await createWorker('eng');
     await workerA.setParameters({
       tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ',
       tessedit_pageseg_mode:   '6',
     });
-
-    const votesA = await passA(workerA, imagePath, gridSize, border);
+    const votesA = await passA(workerA, imagePath, gridSize, border, darkBg);
     await workerA.terminate();
     workerA = null;
 
-    // ── Worker B: PSM 10 for cell-by-cell pass ───────────────────────────────
+    // ── Pass B: cell-by-cell PSM 10 ───────────────────────────────────────────
     workerB = await createWorker('eng');
     await workerB.setParameters({
       tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ',
       tessedit_pageseg_mode:   '10',
     });
-
-    const votesB = await passB(workerB, imagePath, gridSize, border);
+    const votesB = await passB(workerB, imagePath, gridSize, border, darkBg);
     await workerB.terminate();
     workerB = null;
 
-    // ── Merge votes and build final grid ─────────────────────────────────────
+    // ── Merge votes ───────────────────────────────────────────────────────────
+    const mergedVotes = Array.from({ length: gridSize }, (_, r) =>
+      Array.from({ length: gridSize }, (_, c) =>
+        mergeVotes(votesA[r][c], votesB[r][c])
+      )
+    );
+
+    // ── Pass C: rescue unknown cells ──────────────────────────────────────────
+    // For any cell that is still '?' after the two main passes, run an
+    // aggressive extra-contrast re-try with more threshold variants.
+    // This handles thin letters like I/L on dark backgrounds.
+    const meta2   = await sharp(imagePath).metadata();
+    const innerW2 = meta2.width  - 2 * border;
+    const innerH2 = meta2.height - 2 * border;
+    const cellW2  = innerW2 / gridSize;
+    const cellH2  = innerH2 / gridSize;
+
+    let rescueWorker = null;
+    const unknownCells = [];
+    for (let r = 0; r < gridSize; r++) {
+      for (let c = 0; c < gridSize; c++) {
+        if (pickWinner(mergedVotes[r][c]) === '?') unknownCells.push({ r, c });
+      }
+    }
+
+    if (unknownCells.length > 0) {
+      console.log(`[OCR] PassC: rescuing ${unknownCells.length} unknown cell(s)...`);
+
+      // Try multiple PSM modes — thin letters like I/L need PSM 7 or 8
+      const RESCUE_PSM_MODES = ['10', '7', '8', '13'];
+      const RESCUE_THRESHOLDS = [50, 70, 90, 110, 130, 150, 170, 190, 210, 230];
+      const RESCUE_SCALE = 6; // larger upscale for thin single-stroke characters
+
+      for (const psmMode of RESCUE_PSM_MODES) {
+        rescueWorker = await createWorker('eng');
+        await rescueWorker.setParameters({
+          tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ',
+          tessedit_pageseg_mode:   psmMode,
+        });
+
+        for (const { r, c } of unknownCells) {
+          // Skip if already resolved in a previous PSM pass
+          if (pickWinner(mergedVotes[r][c]) !== '?') continue;
+
+          // Use full cell (minimal padding) for rescue to capture thin strokes
+          const left   = Math.round(border + c * cellW2 + cellW2 * 0.02);
+          const top    = Math.round(border + r * cellH2 + cellH2 * 0.02);
+          const width  = Math.max(3, Math.round(cellW2 * 0.96));
+          const height = Math.max(3, Math.round(cellH2 * 0.96));
+
+          for (const th of RESCUE_THRESHOLDS) {
+            try {
+              const buf = await buildBuf(
+                imagePath, { left, top, width, height },
+                th, darkBg, RESCUE_SCALE
+              );
+              const res = await rescueWorker.recognize(buf);
+              const rawCh = (res.data.text || '').replace(/[^A-Za-z0-9|]/g, '').charAt(0);
+              const ch = clean(rawCh);
+              // Only accept high-confidence votes in rescue pass to avoid noise
+              if (ch && res.data.confidence > 40) {
+                mergedVotes[r][c][ch] = (mergedVotes[r][c][ch] || 0) + 1;
+              }
+            } catch (_) {}
+          }
+        }
+
+        await rescueWorker.terminate();
+        rescueWorker = null;
+      }
+
+      for (const { r, c } of unknownCells) {
+        console.log(`[OCR] PassC cell[${r}][${c}]: votes=${JSON.stringify(mergedVotes[r][c])} → ${pickWinner(mergedVotes[r][c])}`);
+      }
+    }
+
+    // ── Build final grid ──────────────────────────────────────────────────────
     const grid = Array.from({ length: gridSize }, (_, r) =>
       Array.from({ length: gridSize }, (_, c) =>
-        pickWinner(mergeVotes(votesA[r][c], votesB[r][c]))
+        pickWinner(mergedVotes[r][c])
       )
     );
 
     console.log('[OCR] Extracted grid:');
     for (const row of grid) console.log('  ' + row.join(' '));
+
+    // Sanity check: if more than 40% of cells are '?' → likely failed
+    const totalCells = gridSize * gridSize;
+    const unknowns   = grid.flat().filter(c => c === '?').length;
+    if (unknowns > totalCells * 0.4) {
+      console.error(`[OCR] Too many unknown cells (${unknowns}/${totalCells}) — extraction unreliable`);
+      return null;
+    }
 
     return grid;
 

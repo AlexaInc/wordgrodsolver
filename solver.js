@@ -69,10 +69,11 @@ for (const [key, alts] of Object.entries(LOOKALIKES_RAW)) {
 
 /**
  * Does `gridChar` match `targetChar` considering OCR lookalikes?
- * Both must be non-empty, non-space.
+ * '?' means OCR was uncertain — treat as wildcard (matches any target).
  */
 function charMatch(target, gridChar) {
-  if (!gridChar || gridChar === ' ' || gridChar === '?') return false;
+  if (!gridChar || gridChar === ' ') return false;
+  if (gridChar === '?') return true; // OCR unknown → wildcard, solver decides
   const t = target.toUpperCase();
   const g = gridChar.toUpperCase();
   if (t === g) return true;
