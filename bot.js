@@ -115,32 +115,26 @@ function parsePatterns(text) {
 }
 
 /**
- * Detect grid size hint from caption text.
- * Returns a number (forced size) or null (let OCR auto-detect).
+ * Check whether this caption should trigger grid processing at all.
+ *
+ * Rules (case-insensitive):
+ *   "WORD GRID CHALLENGE"  → process as 8×8
+ *   "HARD MODE CHALLENGE"  → process as 10×10
+ *   anything else          → ignore (return null)
+ *
+ * Returns: { gridSize: 8|10 }  or  null (skip this message)
  */
-function detectGridSizeFromCaption(text) {
+function getChallengeInfo(text) {
   const upper = text.toUpperCase();
-
-  // Explicit NxN e.g. "10x10" or "8x8"
-  const sizeMatch = text.match(/\b(\d+)\s*[xX×]\s*\1\b/);
-  if (sizeMatch) {
-    const n = parseInt(sizeMatch[1], 10);
-    if (n >= 4 && n <= 15) {
-      console.log(`[Grid] Caption explicit size: ${n}×${n}`);
-      return n;
-    }
+  if (upper.includes('WORD GRID CHALLENGE')) {
+    console.log('[Trigger] WORD GRID CHALLENGE detected → 8×8');
+    return { gridSize: 8 };
   }
-
-  if (
-    upper.includes('HARD MODE') ||
-    upper.includes('10X10') ||
-    upper.includes('10 X 10')
-  ) {
-    console.log('[Grid] Caption phrase → 10×10');
-    return 10;
+  if (upper.includes('HARD MODE CHALLENGE')) {
+    console.log('[Trigger] HARD MODE CHALLENGE detected → 10×10');
+    return { gridSize: 10 };
   }
-
-  return null; // let OCR auto-detect
+  return null; // not a recognised challenge caption — ignore
 }
 
 // ─── Result formatter ─────────────────────────────────────────────────────────
@@ -258,7 +252,14 @@ async function startBot() {
       return;
     }
 
-    // Only handle messages that carry a photo
+    // ── Gate: only act on recognised challenge captions ───────────────────────
+    // Caption MUST contain "WORD GRID CHALLENGE" (→ 8×8)
+    //                   or "HARD MODE CHALLENGE"  (→ 10×10).
+    // All other messages (including plain photos) are silently ignored.
+    const challenge = getChallengeInfo(caption);
+    if (!challenge) return; // not a challenge message — do nothing
+
+    // ── Only handle messages that carry a photo ────────────────────────────────
     const hasPhoto = msg.media && (
       msg.media.className === 'MessageMediaPhoto' ||
       (msg.media.document &&
@@ -266,12 +267,17 @@ async function startBot() {
        msg.media.document.mimeType.startsWith('image/'))
     );
 
-    if (!hasPhoto) return;
+    if (!hasPhoto) {
+      // It's a recognised challenge caption but has no image — let them know
+      await client.sendMessage(chatId, {
+        message: '⚠️ Please attach a grid image together with your challenge caption.',
+      });
+      return;
+    }
 
     // ── Download image to disk via MTProto ─────────────────────────────────────
-    // GramJS downloadMedia accepts a STRING path as outputFile → writes file,
-    // returns the path. Do NOT pass Buffer constructor — that causes the
-    // "writer.write is not a function" error.
+    // Pass a string path as outputFile — GramJS routes this to createWriteStream
+    // (NOT Buffer constructor, which would cause "writer.write is not a function")
     const imagePath = path.join(
       __dirname,
       `grid_${Date.now()}_${Math.random().toString(36).slice(2)}.jpg`
@@ -279,19 +285,17 @@ async function startBot() {
 
     try {
       await client.sendMessage(chatId, {
-        message: '🔍 Downloading and processing your grid image...',
+        message: `🔍 Processing your ${challenge.gridSize}×${challenge.gridSize} grid...`,
       });
 
-      // Pass the destination path string — GramJS streams the file there via MTProto
       const result = await client.downloadMedia(msg, {
         outputFile: imagePath,
       });
 
-      // result is the path string when outputFile is a string path
       if (!result) throw new Error('downloadMedia returned null/undefined');
       if (!fs.existsSync(imagePath)) throw new Error('File not written to disk');
 
-      console.log(`[Download] Saved to ${imagePath} (${fs.statSync(imagePath).size} bytes)`);
+      console.log(`[Download] Saved ${imagePath} (${fs.statSync(imagePath).size} bytes)`);
 
     } catch (dlErr) {
       console.error('[Download] Failed:', dlErr.message);
@@ -306,9 +310,8 @@ async function startBot() {
     try {
       stats.imagesProcessed++;
 
-      const forcedSize = detectGridSizeFromCaption(caption);
-
-      const grid = await extractGrid(imagePath, forcedSize);
+      // Grid size is already determined by the challenge keyword — no guessing
+      const grid = await extractGrid(imagePath, challenge.gridSize);
 
       if (!grid || grid.length === 0) {
         await client.sendMessage(chatId, {
