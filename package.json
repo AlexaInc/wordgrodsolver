@@ -1,0 +1,21 @@
+{
+  "name": "wordgridsolver",
+  "version": "2.0.0",
+  "description": "Telegram bot (GramJS MTProto) to solve 8x8 and 10x10 word grid puzzles",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "test": "node -e \"const {solve}=require('./solver'); console.log('Solver OK');\""
+  },
+  "dependencies": {
+    "axios": "^1.6.0",
+    "check-word": "^1.1.0",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "sharp": "^0.34.5",
+    "telegram": "^2.26.0",
+    "tesseract.js": "^5.0.0",
+    "input": "^1.0.1",
+    "big-integer": "^1.6.52"
+  }
+}
