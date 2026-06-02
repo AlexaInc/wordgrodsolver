@@ -271,15 +271,37 @@ function formatResults(results, grid, patterns) {
     }
 
     if (Array.isArray(entry)) {
-      const startChar   = key[0].toUpperCase();
+      const startChar  = key[0].toUpperCase();   // the letter the pattern STARTS with
+      const wordLen    = key.length;              // exact required length
       const wordMatches = new Set();
 
       for (const hit of entry) {
         const raw = hit.match.toUpperCase();
-        if (isWord(raw)) { wordMatches.add(raw); continue; }
-        const forced = startChar + raw.slice(1);
-        if (isWord(forced)) { wordMatches.add(forced); continue; }
-        console.log(`[Debug] Rejected: ${key} → ${raw}`);
+
+        // ── Strict rule 1: length must match exactly ──────────────────────
+        if (raw.length !== wordLen) continue;
+
+        // ── Strict rule 2: word must start with the pattern letter ────────
+        // The grid cell may be '?' (wildcard) or a lookalike — in both cases
+        // the real word must begin with startChar.
+        // We only accept the grid-literal (raw) or a version where the first
+        // char is replaced with startChar (OCR correction).
+        let accepted = null;
+
+        if (raw[0] === startChar && isWord(raw)) {
+          // Perfect: first letter correct AND dictionary word
+          accepted = raw;
+        } else if (isWord(startChar + raw.slice(1))) {
+          // OCR misread first char — substitute the known correct first letter
+          accepted = startChar + raw.slice(1);
+        }
+        // In both cases the accepted word MUST start with startChar — guaranteed above.
+
+        if (accepted) {
+          wordMatches.add(accepted);
+        } else {
+          console.log(`[Filter] Rejected "${raw}" for pattern "${key}"`);
+        }
       }
 
       if (wordMatches.size > 0) {
